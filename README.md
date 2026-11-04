@@ -1,6 +1,6 @@
 # LLM Photo Tagger
 
-This repo was created to use VLM to add tags to photos to help photo searching e.g. in Synology photos. The pipeline, parameters are optimised for a mounted network drive which is the primary bottleneck for tagging speed. It works with any vision-capable model with openAI compatible API, but Qwen3 VL was chosen here for best tradeoff between speed and quality.
+This repo was created to use VLM to add tags to photos to help photo searching e.g. in Synology photos. The main feature in this repo is that the code/parameters are optimised for a mounted network drive which is the primary bottleneck for tagging speed, and it uses a prefix to ensure easy future removal/update without affecting other tags. It works with any vision-capable model with openAI compatible API, but Qwen3 VL was chosen here for best tradeoff between speed and quality.
 
 
 ## Architecture & Scripts
@@ -48,7 +48,7 @@ pip install -r requirements.txt
 
 ## Server Deployment
 
-Run `llama-server` using hardware isolation and memory optimization flags.
+Run `llama-server`.
 
 ### Example Launch Command for Vision Model (Target Nvidia V100)
 ```bash
@@ -97,4 +97,7 @@ python strip_tags.py
   find "/path/to/photos" -type f -name "*_exiftool_tmp" -delete
   ```
 - **Network Share Latency:**
-  If scanning feels slow, ensure your Synology share is mounted with asynchronous caching enabled (e.g. `actimeo=30` on NFS or `cache=loose` on SMB).
+  To optimise network drive speed, make sure asynchronous caching is enabled (e.g. `actimeo=30` on NFS or `cache=loose` on SMB). Example:
+  ```bash
+  sudo mount -t cifs //nas.local/homes /mnt/synology_photos -o username=username,uid=$(id -u),gid=$(id -g),iocharset=utf8,vers=3.1.1,cache=loose,actimeo=60
+  ```
