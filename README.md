@@ -1,7 +1,10 @@
 # LLM Photo Tagger
 
-This repo was created to use VLM to add tags to photos to help photo searching e.g. in Synology photos. The main feature in this repo is that the code/parameters are optimised for a mounted network drive which is the primary bottleneck for tagging speed, and it uses a prefix to ensure easy future removal/update without affecting other tags. It works with any vision-capable model with openAI compatible API, but Qwen3 VL was chosen here for best tradeoff between speed and quality.
+```
+WARNING!! The tagging script uses exiftool in Overwrite mode, date modified will be changed. This helps the NAS along in noticing that files needs to be indexed (did not check if it also works otherwise) but it also means that files without date-taken info (screenshots etc.) will be indexed as newly taken photo, causing a mess in the timeline view (happened in a Synology NAS). To prevent this, FIRST RUN fix_dates.py to ADD A ROUGH DATE TAKEN FOR ALL PHOTOS WITHOUT IT before overwriting with tags. As long as the folder structure captures year/month, there will be a way to roughly fix the timeline view even after tagging. 
+```
 
+This repo was created to use VLM to add tags to photos to help photo searching e.g. in Synology photos. The main feature in this repo is that the code/parameters are optimised for a mounted network drive which is the primary bottleneck for tagging speed, and it uses a prefix to ensure easy future removal/update without affecting other tags. It works with any vision-capable model with openAI compatible API, but Qwen3 VL was chosen here for best tradeoff between speed and quality. 
 
 ## Architecture & Scripts
 
@@ -15,6 +18,10 @@ This repo was created to use VLM to add tags to photos to help photo searching e
    - **Batch ExifTool Cleaning:** Removes `st_` tags in batches of 100 using temporary argfiles.
    - **Stale Temp Cleanup:** Detects and removes leftover `*_exiftool_tmp` files left behind by aborted processes before writing.
    - **Accurate Auditing:** Verifies execution return codes to provide accurate counts of clean, skipped, and stripped files.
+
+2. **`fix_dates.py` (Fast Date-taken Tagger for Synology NAS)**
+   - **Add Date Taken:** Checks the 202x/xx year/month folder each photo without "take taken" info is in, and add the last modified date as date taken if it is within 6 months from the folder date, otherwise writes the 1st of the folder month as date taken.
+   - **Accurate Auditing:** Verifies execution return codes to provide accurate counts of fixed and skipped files.
 
 ---
 
@@ -65,6 +72,13 @@ llama-server -m Qwen3-VL-8B-Instruct-Q5_K_M.gguf --mmproj mmproj-F16.gguf \
 ---
 
 ## Usage
+
+### 0. Add in "Date Taken" for Photos Without
+This prevents timeline being a mess. Works for Synology Photos where the folder is in 20xx/xx year/month format. For other NAS please check first how your system works. 
+
+```bash
+python tag_photos.py
+```
 
 ### 1. Tagging Untagged Photos
 Runs the streaming prefetch pipeline, sends requests to `llama-server`, and writes tags under the `st_` prefix:
