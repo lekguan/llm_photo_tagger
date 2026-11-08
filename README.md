@@ -1,117 +1,148 @@
 # LLM Photo Tagger
 
+This repo was created to use VLM to add tags to photos to help photo searching e.g. in Synology photos. This tool talks directly to the native **Synology Photos Web API** (`SYNO.Foto` / `SYNO.FotoTeam`). Tags appear immediately in the web interface and mobile app without requiring index rebuilds. The code/parameters are optimised for a web API which is the primary bottleneck for tagging speed, and it uses a prefix to ensure easy future removal/update without affecting other tags. It works with any vision-capable model with openAI compatible API (like `llama-server` or `vLLM`), but Qwen3 VL was chosen here for best tradeoff between speed and quality. 
+
+---
+
+## Key Features
+
+- **Direct Synology Photos Web API Integration:** Interacts directly with `SYNO.Foto.Browse.Item`, `GeneralTag`, and `Thumbnail` endpoints over HTTP/HTTPS.
+- **Pipelined Multi-Stage Concurrency:**
+  - **1 Thumbnail Streamer:** Fetches lightweight, pre-generated `xl` thumbnails directly from DSM using authenticated sessions.
+  - **Concurrent VLM Pool (`INFERENCE_WORKERS`):** Asynchronously dispatches thumbnail batches to your local vision model server.
+  - **Concurrent NAS Writers (`NAS_WRITERS`):** Concurrent, verified tag application in `skip` mode with per-thread HTTP session isolation.
+- **Thread-Safe Tag Catalog Management:** Centralized tag creation and ID resolution with re-entrant locking (`RLock`) to prevent duplicate tag creation on DSM.
+- **Strict Read-Back Verification:** Polls the photo metadata after applying or clearing tags to confirm DSM committed the changes before marking an item as successful.
+- **Three Operational Modes:**
+  - `skip`: Scans library and tags only untagged items (skips photos already containing `TAG_PREFIX`).
+  - `overwrite`: Re-analyzes photos, strips older prefix-generated tags, and applies fresh predictions while preserving custom manual tags.
+  - `clear`: Fast maintenance mode that strips all prefix-generated tags across the library without running model inference.
+- **Namespace Tag Isolation:** Uses a configurable prefix (default: `pt_`) to distinguish AI tags from manual or existing user tags.
+- **Personal and Shared Space Support:** Easily toggle between personal libraries and Synology Shared Space (`USE_SHARED_SPACE`).
+
+---
+
+## Architecture Overview
+
+```text
+       ┌────────────────────────┐
+       │ Synology Photos API    │ (Fetch candidate list)
+       └───────────┬────────────┘
+                   │
+                   ▼
+       ┌────────────────────────┐
+       │ 1x Thumbnail Fetcher   │ (Downloads base64 'xl' thumbs)
+       └───────────┬────────────┘
+                   │
+                   ▼
+       ┌────────────────────────┐
+       │  4x VLM Workers        │ (OpenAI-compatible /chat/completions)
+       └───────────┬────────────┘
+                   │ Bounded Queue (PREPARE_QUEUE_SIZE)
+                   ▼
+       ┌────────────────────────┐
+       │  2x NAS Writers        │ (Resolve/Create Tag IDs -> Add Tag -> Verify)
+       └────────────────────────┘
 ```
-WARNING!! The tagging script uses exiftool in Overwrite mode, date modified will be changed. This helps the NAS along in noticing that files needs to be indexed (did not check if it also works otherwise) but it also means that files without date-taken info (screenshots etc.) will be indexed as newly taken photo, causing a mess in the timeline view (happened in a Synology NAS). To prevent this, FIRST RUN fix_dates.py to ADD A ROUGH DATE TAKEN FOR ALL PHOTOS WITHOUT IT before overwriting with tags. As long as the folder structure captures year/month, there will be a way to roughly fix the timeline view even after tagging. 
-```
-
-This repo was created to use VLM to add tags to photos to help photo searching e.g. in Synology photos. The main feature in this repo is that the code/parameters are optimised for a mounted network drive which is the primary bottleneck for tagging speed, and it uses a prefix to ensure easy future removal/update without affecting other tags. It works with any vision-capable model with openAI compatible API, but Qwen3 VL was chosen here for best tradeoff between speed and quality. 
-
-## Architecture & Scripts
-
-1. **`tag_photos.py` (Fast Photo Tagger)**
-   - **Streaming Chunk Inspection:** Evaluates files in 250-item batches using ExifTool over stdin, eliminating per-file process startup overhead.
-   - **In-Memory RAM Prefetcher:** Downloads and Lanczos-downsamples images into Base64 payloads ahead of time, ensuring 0 ms disk read latency when a GPU worker is ready.
-   - **Decoupled Asynchronous Writer:** Offloads XMP/IPTC/EXIF file writes to a dedicated background worker so GPU workers never block on remote SMB/NFS disk write locks.
-   - **Zero Sleep Dispatches:** Fully relies on `llama-server` continuous batching without artificial client-side delays.
-
-2. **`strip_tags.py` (Fast Tag Stripper)**
-   - **Batch ExifTool Cleaning:** Removes `st_` tags in batches of 100 using temporary argfiles.
-   - **Stale Temp Cleanup:** Detects and removes leftover `*_exiftool_tmp` files left behind by aborted processes before writing.
-   - **Accurate Auditing:** Verifies execution return codes to provide accurate counts of clean, skipped, and stripped files.
-
-2. **`fix_dates.py` (Fast Date-taken Tagger for Synology NAS)**
-   - **Add Date Taken:** Checks the 202x/xx year/month folder each photo without "take taken" info is in, and add the last modified date as date taken if it is within 6 months from the folder date, otherwise writes the 1st of the folder month as date taken.
-   - **Accurate Auditing:** Verifies execution return codes to provide accurate counts of fixed and skipped files.
 
 ---
 
 ## Prerequisites
 
-### 1. System Dependencies (ExifTool)
-ExifTool is required on the host system to read and write metadata.
+### 1. Environment Requirements
+- Python 3.10+
+- Network access to:
+  - Your Synology NAS DSM web port (default: `5000` for HTTP or `5001` for HTTPS)
+  - Your local VLM inference endpoint (default: `http://127.0.0.1:9931`)
 
-```bash
-# Ubuntu / Debian
-sudo apt-get update && sudo apt-get install -y exiftool libimage-exiftool-perl
+### 2. Python Dependencies
+Install the required standard dependencies:
 
-# Arch Linux
-sudo pacman -S perl-image-exiftool
-
-# RHEL / Fedora / Rocky Linux
-sudo dnf install -y perl-Image-ExifTool
-```
-
-Verify installation:
-```bash
-exiftool -ver
-```
-
-### 2. Python Environment Setup
 ```bash
 pip install -r requirements.txt
 ```
 
 ---
 
-## Server Deployment
+## Local VLM Server Setup
 
-Run `llama-server`.
+The script expects an OpenAI-compatible vision completion endpoint (`/v1/chat/completions`).
 
-### Example Launch Command for Vision Model (Target Nvidia V100)
+### Example: Running with `llama-server`
+### Example Launch Command for Vision Model
 ```bash
-llama-server -m Qwen3-VL-8B-Instruct-Q5_K_M.gguf --mmproj mmproj-F16.gguf \
+llama-server -m Qwen3-VL-8B-Instruct-Q5_K_M.gguf --mmproj /home/lek/llama_cpp/mmproj-Qwen3-VL-8B-F16.gguf \
   -ngl 99 --threads 4 -fa on --cache-type-k q8_0 --cache-type-v q8_0 -np 4 -c 8192 -b 4096 -ub 2048 \
   --temp 0.2 --top-p 0.95 --min-p 0.05 --no-cache-prompt --cache-ram 0 --image-min-tokens 1024 --image-max-tokens 1024
 ```
 
-### Server Configuration Details
-- `-np 4 -c 8192`: Allocates 4 parallel continuous batching slots with 2,048 tokens each (1,024 vision tokens + prompt + 128 response tokens).
-- `-ub 2048`: Ensures the entire 1,024-token visual patch sequence evaluates in a single forward pass without chunking stalls.
-- `--no-cache-prompt --cache-ram 0`: Disables prompt prefix caching to prevent PCIe/RAM thrashing from unique image payloads.
+---
+
+## Configuration
+
+Edit the settings block at the top of `tag_photos.py`:
+
+```python
+# ======================================================================
+# NAS Credentials & Endpoint
+# ======================================================================
+NAS_HOST = "http://192.168.1.100:5000"  # Synology DSM URL
+DSM_USERNAME = "your_dsm_username"
+DSM_PASSWORD = "your_dsm_password"
+USE_SHARED_SPACE = False  # Set to True for Shared Space (/photo)
+
+# ======================================================================
+# Model & Endpoint Configuration
+# ======================================================================
+SERVER_URL = "http://127.0.0.1:9931/v1/chat/completions"
+VLM_MODEL = "qwen3-vl-8b"
+
+# ======================================================================
+# Execution Mode & Limits
+# ======================================================================
+# "skip"      -> Tag untagged photos only
+# "overwrite" -> Re-analyze photos, replace old prefix tags
+# "clear"     -> Strip all prefix tags without running VLM
+MODE = "skip"
+
+# Maximum photos to process (set to None for full library)
+MAX_CANDIDATES = 100
+
+# Prefix attached to all generated tags
+TAG_PREFIX = "pt_"
+
+# ======================================================================
+# Concurrency & Tuning
+# ======================================================================
+INFERENCE_WORKERS = 4  # Concurrent requests to VLM server
+NAS_WRITERS = 2  # Concurrent writers to Synology API (skip mode)
+PREPARE_QUEUE_SIZE = 8  # Bounded queue buffer size
+```
 
 ---
 
 ## Usage
 
-### 0. Add in "Date Taken" for Photos Without
-This prevents timeline being a mess. Works for Synology Photos where the folder is in 20xx/xx year/month format. For other NAS please check first how your system works. 
+Run the script directly from your terminal:
 
 ```bash
 python tag_photos.py
 ```
 
-### 1. Tagging Untagged Photos
-Runs the streaming prefetch pipeline, sends requests to `llama-server`, and writes tags under the `st_` prefix:
-
-```bash
-python tag_photos.py
-```
-
-Configuration variables inside `tag_photos.py`:
-- `PHOTO_DIR`: Path to your local or mounted photo library.
-- `SERVER_URL`: `llama-server` endpoint (`http://127.0.0.1:9931/v1/chat/completions`).
-- `TAG_PREFIX`: Custom tag prefix (`st_`) so it can be stripped easily in future if required while leaving other tags untouched.
-- `MAX_WORKERS`: Set to `4` to match your `-np 4` server slots.
-- `CHUNK_SIZE`: Number of files inspected per ExifTool batch check (`250`).
-
-### 2. Stripping Generated Tags
-Quickly removes all metadata tags starting with `st_` across your library:
-
-```bash
-python strip_tags.py
-```
+### Execution Flow
+1. **Login & Scan:** Authenticates against `SYNO.API.Auth` and pages through `Item.list` to collect eligible photos.
+2. **Confirmation (for `overwrite` / `clear`):** If destructive actions are requested, the script requires typing `yes` before proceeding.
+3. **Pipeline Processing:**
+   - Fetches cached thumbnails (`Thumbnail.get`).
+   - Sends the base64-encoded image to the local VLM with strict noun-focused prompts.
+   - Normalizes tags and resolves catalog tag IDs (`GeneralTag.list` / `GeneralTag.create`).
+   - Applies tags (`Item.add_tag`) and verifies via read-back (`Item.get`).
+4. **Summary & Graceful Shutdown:** Outputs processed rates, skips, and verification status. Pressing `Ctrl+C` initiates safe backpressure shutdown, allowing in-flight writes to cleanly complete and verify.
 
 ---
 
-## Troubleshooting & Maintenance
+## Tuning Recommendations
 
-- **Orphaned Temp Files (`*_exiftool_tmp`):**
-  If a previous run was killed abruptly and left stale lock files on your network share, clear them manually:
-  ```bash
-  find "/path/to/photos" -type f -name "*_exiftool_tmp" -delete
-  ```
-- **Network Share Latency:**
-  To optimise network drive speed, make sure asynchronous caching is enabled (e.g. `actimeo=30` on NFS or `cache=loose` on SMB). Example:
-  ```bash
-  sudo mount -t cifs //nas.local/homes /mnt/synology_photos -o username=username,uid=$(id -u),gid=$(id -g),iocharset=utf8,vers=3.1.1,cache=loose,actimeo=60
-  ```
+- **Writer Concurrency (`NAS_WRITERS`):** In testing against Synology DSM, `2` writers typically yields the best balance between speed and minimal DSM request contention. `overwrite` and `clear` modes automatically restrict themselves to `1` writer for tag preservation safety.
+- **Inference Workers (`INFERENCE_WORKERS`):** Set this to match the parallel continuous batching slots configured on your local model runner (e.g. `-np 4` on `llama-server`).
+

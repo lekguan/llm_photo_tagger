@@ -1,8 +1,2 @@
-# Image processing and resizing (locked to Pillow 10/11 series)
-Pillow>=10.2.0,<12.0.0
-
-# Optional HEIC/HEIF photo support (locked below major API changes)
-pillow-heif>=0.16.0,<2.0.0
-
-# HTTP client library for llama-server integration (locked to stable 2.x)
+# HTTP client for Synology Photos API and local VLM server communications
 requests>=2.31.0,<3.0.0
