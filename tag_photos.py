@@ -15,9 +15,9 @@ import requests
 # ======================================================================
 # Configuration
 # ======================================================================
-NAS_HOST = "http://192.168.1.100:5000"                  # Synology IP & Port
-DSM_USERNAME = "your_username"
-DSM_PASSWORD = "your_password"
+NAS_HOST = "http://192.168.1.100:5000"  # Synology DSM URL
+DSM_USERNAME = "your_dsm_username"
+DSM_PASSWORD = "your_dsm_password"
 # ======================================================================
 # Configuration
 # ======================================================================
@@ -39,7 +39,7 @@ TAG_PREFIX = "pt_"
 BATCH_FETCH_SIZE = 500
 VERIFY_TLS = True
 
-API_TIMEOUT = 30
+API_TIMEOUT = (10, 60)
 VLM_TIMEOUT = 60
 
 VERIFY_ATTEMPTS = 5
@@ -268,13 +268,41 @@ def get_candidates():
             remaining = MAX_CANDIDATES - len(candidates)
             page_size = min(page_size, remaining)
 
-        data = api_call(
-            API_ITEM,
-            "list",
-            additional=json.dumps(additional_fields),
-            offset=offset,
-            limit=page_size,
-        )
+        scan_attempts = 3
+
+        for attempt in range(1, scan_attempts + 1):
+            try:
+                data = api_call(
+                    API_ITEM,
+                    "list",
+                    additional=json.dumps(additional_fields),
+                    offset=offset,
+                    limit=page_size,
+                )
+                break
+
+            except (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+            ) as exc:
+                if attempt == scan_attempts:
+                    raise RuntimeError(
+                        "Library scan failed after "
+                        f"{scan_attempts} attempts "
+                        f"at offset={offset}, limit={page_size}: {exc}"
+                    ) from exc
+
+                delay = 5 * attempt
+
+                print(
+                    f"[SCAN RETRY] offset={offset} "
+                    f"| limit={page_size} "
+                    f"| attempt={attempt}/{scan_attempts} "
+                    f"| retrying in {delay}s "
+                    f"| {exc}"
+                )
+
+                time.sleep(delay)
 
         items = require_list(data, "Item.list")
 
