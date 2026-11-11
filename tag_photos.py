@@ -36,10 +36,15 @@ MODE = "skip"
 
 TAG_PREFIX = "pt_"
 
+# Path within the selected Photos space, NOT /volume1/... or an SMB path.
+# Replace this placeholder before running. None explicitly allows the whole space.
+TARGET_DIRECTORY = "/MobileBackup"
+INCLUDE_SUBDIRECTORIES = True
+
 BATCH_FETCH_SIZE = 500
 VERIFY_TLS = True
 
-API_TIMEOUT = (10, 60)
+API_TIMEOUT = (10, 120)
 VLM_TIMEOUT = 60
 
 VERIFY_ATTEMPTS = 5
@@ -64,6 +69,9 @@ API_PREFIX = "SYNO.FotoTeam" if USE_SHARED_SPACE else "SYNO.Foto"
 API_ITEM = f"{API_PREFIX}.Browse.Item"
 API_GENERAL_TAG = f"{API_PREFIX}.Browse.GeneralTag"
 API_THUMB = f"{API_PREFIX}.Thumbnail"
+API_FOLDER = f"{API_PREFIX}.Browse.Folder"
+allowed_folder_ids = None
+folder_paths = {}
 
 session = requests.Session()
 session.verify = VERIFY_TLS
@@ -223,147 +231,184 @@ def login():
     print("[+] Logged into Synology Photos.")
 
 
-def get_candidates():
-    print(
-        f"[*] Scanning library | Mode: {MODE.upper()} "
-        f"| Candidate limit: "
-        f"{MAX_CANDIDATES if MAX_CANDIDATES is not None else 'unlimited'}"
-    )
+def normalize_photo_directory(value):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("TARGET_DIRECTORY must be a non-empty Photos path or None.")
+    value = value.strip()
+    if "\\" in value:
+        raise ValueError("Use a Photos-relative path with forward slashes.")
+    parts = [p for p in value.split("/") if p]
+    if any(p in {".", ".."} for p in parts):
+        raise ValueError("Directory paths must not contain '.' or '..'.")
+    return "/" + "/".join(parts)
 
+
+def scan_read_call(api, **params):
+    for attempt in range(1, 4):
+        try:
+            return api_call(api, "list", **params)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            if attempt == 3:
+                raise
+            print(f"[SCAN RETRY] {api}.list | {attempt}/3", flush=True)
+            time.sleep(5 * attempt)
+
+
+def list_child_photo_folders(parent_id=None):
+    result, seen = [], set()
     offset = 0
-    scanned = 0
-    skipped = 0
-    candidates = []
-    seen_ids = set()
-    scan_started = time.perf_counter()
-
-    additional_fields = (
-        ["tag"]
-        if MODE == "clear"
-        else ["tag", "thumbnail"]
-    )
-
-    def finish(limit_reached=False):
-        elapsed = time.perf_counter() - scan_started
-        reason = (
-            "candidate limit reached"
-            if limit_reached
-            else "end of library"
-        )
-
-        print(
-            f"[+] Scan stopped: {reason}. "
-            f"Checked: {scanned} | Queued: {len(candidates)} "
-            f"| Skipped: {skipped} | Time: {elapsed:.2f}s "
-            f"| Scan speed: "
-            f"{scanned / max(elapsed, 0.01):.1f} photos/sec\n"
-        )
-
-        return candidates
-
     while True:
-        page_size = BATCH_FETCH_SIZE
+        params = {"offset": offset, "limit": BATCH_FETCH_SIZE}
+        if parent_id is not None:
+            params["id"] = int(parent_id)
+        page = require_list(scan_read_call(API_FOLDER, **params), "Folder.list")
+        for folder in page:
+            if (not isinstance(folder, dict) or not isinstance(folder.get("name"), str)
+                    or folder.get("id") is None or isinstance(folder.get("id"), bool)):
+                raise RuntimeError(f"Unexpected folder object: {folder!r}")
+            fid = int(folder["id"])
+            if fid in seen:
+                raise RuntimeError("Folder pagination repeated an ID.")
+            seen.add(fid)
+            result.append(folder)
+        offset += len(page)
+        if len(page) < BATCH_FETCH_SIZE:
+            return result
 
-        if MAX_CANDIDATES is not None:
-            remaining = MAX_CANDIDATES - len(candidates)
-            page_size = min(page_size, remaining)
 
-        scan_attempts = 3
+def child_folder_path(parent_path, reported_name):
+    path = normalize_photo_directory(reported_name)
+    if parent_path == "/":
+        return path
+    if path.startswith(parent_path + "/"):
+        return path
+    if "/" not in path.strip("/"):
+        return parent_path + path
+    raise RuntimeError(f"Unexpected child path {path!r} beneath {parent_path!r}.")
 
-        for attempt in range(1, scan_attempts + 1):
-            try:
-                data = api_call(
-                    API_ITEM,
-                    "list",
-                    additional=json.dumps(additional_fields),
-                    offset=offset,
-                    limit=page_size,
-                )
+
+def configure_directory_scope():
+    global allowed_folder_ids, folder_paths
+    allowed_folder_ids = None
+    folder_paths = {0: "/"}
+    if not isinstance(INCLUDE_SUBDIRECTORIES, bool):
+        raise ValueError("INCLUDE_SUBDIRECTORIES must be True or False.")
+    target = normalize_photo_directory(TARGET_DIRECTORY) if TARGET_DIRECTORY is not None else "/"
+    if target == "/" and TARGET_DIRECTORY is not None and not INCLUDE_SUBDIRECTORIES:
+        raise ValueError("Root-only mode is unsupported; choose a named folder.")
+    if target == "/":
+        print("[*] Reading folder paths for the selected Photos space...", flush=True)
+        pending = [(None, "/")]
+        visited = set()
+    else:
+        parent_id, resolved = None, ""
+        print(f"[*] Resolving Photos directory: {target}", flush=True)
+        for component in target.strip("/").split("/"):
+            expected = f"{resolved}/{component}"
+            children = list_child_photo_folders(parent_id)
+            matches = [f for f in children
+                       if normalize_photo_directory(f["name"]) in {expected, f"/{component}"}]
+            if len(matches) != 1:
+                available = "\n".join(f"  {f['name']} (ID:{f['id']})" for f in children[:40])
+                raise RuntimeError(f"Could not uniquely resolve {expected!r}. No photos will be processed."
+                                   f"\nAvailable children (up to 40):\n{available}")
+            parent_id, resolved = int(matches[0]["id"]), expected
+            folder_paths[parent_id] = resolved
+            print(f"    Resolved: {resolved} (ID:{parent_id})", flush=True)
+        allowed_folder_ids = {parent_id}
+        pending = [(parent_id, target)] if INCLUDE_SUBDIRECTORIES else []
+        visited = {parent_id}
+    while pending:
+        parent_id, parent_path = pending.pop()
+        for folder in list_child_photo_folders(parent_id):
+            fid = int(folder["id"])
+            if fid in visited:
+                raise RuntimeError("Folder traversal repeated an ID; refusing ambiguous scope.")
+            visited.add(fid)
+            path = child_folder_path(parent_path, folder["name"])
+            folder_paths[fid] = path
+            if allowed_folder_ids is not None:
+                allowed_folder_ids.add(fid)
+            pending.append((fid, path))
+    print(f"[+] Directory scope: {target} | "
+          f"Folders: {len(allowed_folder_ids) if allowed_folder_ids is not None else len(visited)}", flush=True)
+
+
+def photo_is_in_scope(item):
+    if allowed_folder_ids is None:
+        return True
+    value = item.get("folder_id")
+    if value is None or isinstance(value, bool):
+        raise RuntimeError(f"Photo {item.get('id')}: missing/invalid folder_id.")
+    return int(value) in allowed_folder_ids
+
+
+def get_candidates():
+    print(f"[*] Scanning selected scope | Mode: {MODE.upper()} "
+          f"| Candidate limit: {MAX_CANDIDATES}", flush=True)
+    candidates, seen = [], set()
+    scanned = skipped = 0
+    started = time.perf_counter()
+    fields = ["tag"] if MODE == "clear" else ["tag", "thumbnail"]
+    folder_ids = sorted(allowed_folder_ids) if allowed_folder_ids is not None else [None]
+    def finish(reason):
+        elapsed = time.perf_counter() - started
+        print(f"[+] Scan stopped: {reason}. Checked: {scanned} | Queued: {len(candidates)} "
+              f"| Skipped: {skipped} | Time: {elapsed:.2f}s\n", flush=True)
+        return candidates
+    for folder_id in folder_ids:
+        offset, folder_seen = 0, set()
+        if folder_id is not None:
+            print(f"    Browsing: {folder_paths[folder_id]} (ID:{folder_id})", flush=True)
+        while True:
+            limit = BATCH_FETCH_SIZE
+            if MAX_CANDIDATES is not None:
+                limit = min(limit, MAX_CANDIDATES - len(candidates))
+            params = {"offset": offset, "limit": limit, "additional": json.dumps(fields)}
+            if folder_id is not None:
+                params["folder_id"] = int(folder_id)
+            items = require_list(scan_read_call(API_ITEM, **params), "Item.list")
+            if not items:
                 break
-
-            except (
-                requests.exceptions.Timeout,
-                requests.exceptions.ConnectionError,
-            ) as exc:
-                if attempt == scan_attempts:
-                    raise RuntimeError(
-                        "Library scan failed after "
-                        f"{scan_attempts} attempts "
-                        f"at offset={offset}, limit={page_size}: {exc}"
-                    ) from exc
-
-                delay = 5 * attempt
-
-                print(
-                    f"[SCAN RETRY] offset={offset} "
-                    f"| limit={page_size} "
-                    f"| attempt={attempt}/{scan_attempts} "
-                    f"| retrying in {delay}s "
-                    f"| {exc}"
-                )
-
-                time.sleep(delay)
-
-        items = require_list(data, "Item.list")
-
-        if not items:
-            return finish()
-
-        for item in items:
-            scanned += 1
-            item_id = int(item["id"])
-
-            if item_id in seen_ids:
-                skipped += 1
-                continue
-
-            seen_ids.add(item_id)
-
-            tags = item_tags(item)
-            has_generated = any(
-                is_generated(tag["name"]) for tag in tags
-            )
-
-            eligible = (
-                (MODE == "skip" and not has_generated)
-                or (MODE == "clear" and has_generated)
-                or MODE == "overwrite"
-            )
-
-            if not eligible:
-                skipped += 1
-                continue
-
-            thumbnail = item["additional"].get("thumbnail") or {}
-
-            candidates.append({
-                "id": item_id,
-                "filename": item.get(
-                    "filename",
-                    f"photo_{item_id}",
-                ),
-                "cache_key": (
-                    thumbnail.get("cache_key")
-                    or item.get("cache_key")
-                ),
-                "thumbnail_unit_id": thumbnail.get("unit_id"),
-            })
-
-            if (
-                MAX_CANDIDATES is not None
-                and len(candidates) >= MAX_CANDIDATES
-            ):
-                return finish(limit_reached=True)
-
-        offset += len(items)
-
-        print(
-            f"    Checked: {scanned} | "
-            f"Queued: {len(candidates)} | Skipped: {skipped}"
-        )
-
-        if len(items) < page_size:
-            return finish()
+            for item in items:
+                scanned += 1
+                item_id = int(item["id"])
+                if item_id in folder_seen:
+                    raise RuntimeError("Photo pagination repeated an ID.")
+                folder_seen.add(item_id)
+                actual = item.get("folder_id")
+                if actual is None or isinstance(actual, bool):
+                    raise RuntimeError(f"Photo {item_id} has no valid folder_id.")
+                actual = int(actual)
+                if folder_id is not None and actual != folder_id:
+                    raise RuntimeError(f"Listing for folder {folder_id} returned photo {item_id} "
+                                       f"with folder_id={actual}. No writes have started.")
+                if item_id in seen:
+                    skipped += 1
+                    continue
+                seen.add(item_id)
+                if not photo_is_in_scope(item):
+                    raise RuntimeError("Photo outside configured scope.")
+                tags = item_tags(item)
+                generated = any(is_generated(t["name"]) for t in tags)
+                if not ((MODE == "skip" and not generated) or (MODE == "clear" and generated)
+                        or MODE == "overwrite"):
+                    skipped += 1
+                    continue
+                if actual not in folder_paths:
+                    raise RuntimeError(f"Unknown folder ID {actual}; rerun to refresh folder paths.")
+                filename = item.get("filename", f"photo_{item_id}")
+                full_path = folder_paths[actual].rstrip("/") + "/" + filename
+                thumb = item["additional"].get("thumbnail") or {}
+                candidates.append({"id": item_id, "filename": filename, "full_path": full_path,
+                                   "cache_key": thumb.get("cache_key") or item.get("cache_key"),
+                                   "thumbnail_unit_id": thumb.get("unit_id")})
+                if MAX_CANDIDATES is not None and len(candidates) >= MAX_CANDIDATES:
+                    return finish("candidate limit reached")
+            offset += len(items)
+            if len(items) < limit:
+                break
+    return finish("end of selected scope")
 
 
 def read_photo_tags(item_id):
@@ -387,7 +432,10 @@ def read_photo_tags(item_id):
             f"Could not uniquely read photo {item_id}."
         )
 
-    return item_tags(matching[0])
+    item = matching[0]
+    if not photo_is_in_scope(item):
+        raise RuntimeError(f"Photo {item_id} is outside configured scope; refusing processing.")
+    return item_tags(item)
 
 
 # ======================================================================
@@ -518,42 +566,6 @@ def get_vlm_tags(mime_type, encoded_image):
 # ======================================================================
 # Tag catalog
 # ======================================================================
-def load_tag_catalog():
-    catalog = {}
-    offset = 0
-    limit = 1000
-
-    while True:
-        data = api_call(
-            API_GENERAL_TAG,
-            "list",
-            offset=offset,
-            limit=limit,
-        )
-
-        tags = require_list(data, "GeneralTag.list")
-
-        for tag in tags:
-            if (
-                not isinstance(tag, dict)
-                or not isinstance(tag.get("name"), str)
-                or "id" not in tag
-            ):
-                raise RuntimeError(
-                    f"Unexpected catalog tag: "
-                    f"{json.dumps(tag, ensure_ascii=False)}"
-                )
-
-            catalog[tag["name"]] = int(tag["id"])
-
-        offset += len(tags)
-
-        if len(tags) < limit:
-            break
-
-    return catalog
-
-
 def extract_created_tag_id(data, expected_name):
     if not isinstance(data, dict):
         return None
@@ -589,57 +601,41 @@ def extract_created_tag_id(data, expected_name):
 
 
 def resolve_tag_ids(names, force_refresh=False):
-    global tag_catalog_cache
+    """Create/resolve uncached names without downloading the tag catalog.
 
+    Requires the NAS to return an existing tag ID for an existing name.
+    """
+    global tag_catalog_cache
     with catalog_lock:
         if force_refresh or tag_catalog_cache is None:
-            tag_catalog_cache = load_tag_catalog()
-
+            tag_catalog_cache = {}
         ids = []
-
-        for name in names:
+        for name in dict.fromkeys(names):
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"Invalid tag name: {name!r}")
             if name in tag_catalog_cache:
                 ids.append(tag_catalog_cache[name])
                 continue
-
             try:
-                data = api_call(
-                    API_GENERAL_TAG,
-                    "create",
-                    name=json.dumps(name, ensure_ascii=False),
-                )
-
-            except Exception:
-                tag_catalog_cache = load_tag_catalog()
-
-                if name not in tag_catalog_cache:
-                    raise
-
-                ids.append(tag_catalog_cache[name])
-                continue
-
-            tag_id = extract_created_tag_id(data, name)
-
-            if tag_id is None:
-                tag_catalog_cache = load_tag_catalog()
-                tag_id = tag_catalog_cache.get(name)
-
+                data = api_call(API_GENERAL_TAG, "create", name=json.dumps(name, ensure_ascii=False))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"GeneralTag.create failed for {name!r}: {exc}. "
+                    "No catalog download or automatic create retry was performed. "
+                    "The server may have processed the request despite a lost response."
+                ) from exc
+            tag_id = extract_created_tag_id(data, expected_name=name)
             if tag_id is None:
                 raise RuntimeError(
-                    f"Created tag {name!r}, but could not resolve its ID. "
-                    f"Response data: "
-                    f"{json.dumps(data, ensure_ascii=False)}"
+                    f"GeneralTag.create succeeded for {name!r}, but returned no usable ID. "
+                    "No catalog download was performed. Response data: "
+                    f"{json.dumps(data, ensure_ascii=False)[:2000]}"
                 )
-
             tag_catalog_cache[name] = tag_id
             ids.append(tag_id)
-
         return list(dict.fromkeys(ids))
 
 
-# ======================================================================
-# Writes and verification
-# ======================================================================
 def add_tag_ids(item_id, tag_ids):
     global tag_catalog_cache
 
@@ -830,124 +826,61 @@ def queue_put_until_stopped(output_queue, value, stop_event):
 
 
 def prepare_photos(candidates, output_queue, stop_event):
-    """
-    One thread downloads thumbnails and coordinates a bounded pool
-    of concurrent VLM requests. No NAS tag writes happen here.
-    """
-    inference_pool = None
-    pending = {}
-
-    def emit_finished(block=False):
-        if not pending:
-            return
-
-        done, _ = wait(
-            tuple(pending),
-            timeout=0.25 if block else 0,
-            return_when=FIRST_COMPLETED,
-        )
-
-        for future in done:
-            prepared = pending.pop(future)
-
+    """One downloader feeds inference workers that publish results directly."""
+    thumbnail_queue = Queue(maxsize=INFERENCE_WORKERS)
+    workers = []
+    def inference_worker():
+        while not stop_event.is_set():
             try:
-                prepared["names"] = future.result()
-            except Exception as exc:
-                prepared["error"] = str(exc)
-
-            if not queue_put_until_stopped(
-                output_queue,
-                prepared,
-                stop_event,
-            ):
-                return
-
+                job = thumbnail_queue.get(timeout=0.25)
+            except Empty:
+                continue
+            try:
+                if job is None:
+                    return
+                index, item, mime, encoded = job
+                prepared = {"index": index, "item": item, "names": None, "error": None}
+                try:
+                    prepared["names"] = get_vlm_tags(mime, encoded)
+                    if not prepared["names"]:
+                        raise RuntimeError("VLM returned no usable tags.")
+                except Exception as exc:
+                    prepared["error"] = str(exc)
+                if not queue_put_until_stopped(output_queue, prepared, stop_event):
+                    return
+                del job, encoded, prepared
+            finally:
+                thumbnail_queue.task_done()
     try:
-        inference_pool = ThreadPoolExecutor(
-            max_workers=INFERENCE_WORKERS,
-            thread_name_prefix="vlm",
-        )
-
-        with clone_nas_session() as preparation_session:
+        for number in range(INFERENCE_WORKERS):
+            worker = threading.Thread(target=inference_worker, name=f"vlm-{number + 1}", daemon=True)
+            worker.start()
+            workers.append(worker)
+        with clone_nas_session() as client:
             for index, item in enumerate(candidates, 1):
                 if stop_event.is_set():
                     break
-
-                emit_finished()
-
-                # No unbounded executor backlog of image payloads.
-                while (
-                    len(pending) >= INFERENCE_WORKERS
-                    and not stop_event.is_set()
-                ):
-                    emit_finished(block=True)
-
-                if stop_event.is_set():
-                    break
-
-                prepared = {
-                    "index": index,
-                    "item": item,
-                    "names": None,
-                    "error": None,
-                }
-
                 try:
-                    mime_type, encoded = fetch_thumb(
-                        item["id"],
-                        item.get("cache_key"),
-                        item.get("thumbnail_unit_id"),
-                        http_session=preparation_session,
-                    )
-
+                    mime, encoded = fetch_thumb(item["id"], item.get("cache_key"),
+                                               item.get("thumbnail_unit_id"), http_session=client)
                 except Exception as exc:
-                    prepared["error"] = str(exc)
-
-                    if not queue_put_until_stopped(
-                        output_queue,
-                        prepared,
-                        stop_event,
-                    ):
+                    if not queue_put_until_stopped(output_queue,
+                        {"index": index, "item": item, "names": None, "error": str(exc)}, stop_event):
                         break
-
                     continue
-
-                if stop_event.is_set():
+                if not queue_put_until_stopped(thumbnail_queue, (index, item, mime, encoded), stop_event):
                     break
-
-                future = inference_pool.submit(
-                    get_vlm_tags,
-                    mime_type,
-                    encoded,
-                )
-                pending[future] = prepared
-
-                # Avoid retaining another reference while waiting.
                 del encoded
-
-            while pending and not stop_event.is_set():
-                emit_finished(block=True)
-
     except Exception as exc:
-        queue_put_until_stopped(
-            output_queue,
-            {"pipeline_error": str(exc)},
-            stop_event,
-        )
-
+        queue_put_until_stopped(output_queue, {"pipeline_error": str(exc)}, stop_event)
     finally:
-        if inference_pool is not None:
-            for future in pending:
-                future.cancel()
-
-            # Running inference requests cannot be forcibly cancelled.
-            inference_pool.shutdown(wait=True)
-
-        queue_put_until_stopped(
-            output_queue,
-            None,
-            stop_event,
-        )
+        if not stop_event.is_set():
+            for _ in workers:
+                if not queue_put_until_stopped(thumbnail_queue, None, stop_event):
+                    break
+        for worker in workers:
+            worker.join()
+        queue_put_until_stopped(output_queue, None, stop_event)
 
 
 # ======================================================================
@@ -989,6 +922,7 @@ def main():
         tag_catalog_cache = None
 
     login()
+    configure_directory_scope()
     candidates = get_candidates()
 
     if not candidates:
@@ -1008,6 +942,8 @@ def main():
         print(f"Space            : {space}")
         print(f"Photos queued    : {len(candidates)}")
         print(f"Tag prefix       : {TAG_PREFIX!r}")
+        print(f"Directory        : {TARGET_DIRECTORY if TARGET_DIRECTORY is not None else 'ALL'}")
+        print(f"Subdirectories   : {INCLUDE_SUBDIRECTORIES}")
         print("NAS writers      : 1 (removal safety)")
 
         if MODE == "clear":
@@ -1054,9 +990,10 @@ def main():
 
         print(
             f"[{completed}/{len(candidates)}] [{status}] "
-            f"{item['filename']} (ID:{item['id']}) "
+            f"{item['full_path']} (ID:{item['id']}) "
             f"| Average verified: {rate:.2f} photos/sec "
-            f"-> {detail}"
+            f"-> {detail}",
+            flush=True,
         )
 
     def collect_writes(block=False):
